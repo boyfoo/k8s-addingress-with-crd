@@ -12,7 +12,7 @@
 
 运行`./hack/update-codegen.sh`，查看是否能顺利生成
 
-目前代码`v-init`
+目前代码`tag:nit`
 
 
 
