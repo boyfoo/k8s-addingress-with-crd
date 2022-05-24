@@ -1,3 +1,5 @@
+创建对于`crd`资源，自动创建`delpoy,svc,ingress`
+
 ### 下载安装
 
 下载官方示例 `git clone git@github.com:kubernetes/sample-controller.git`
@@ -14,6 +16,10 @@
 
 目前代码`tag:init`
 
+编写完需求代码后，生成`crd`创建文件： `controller-gen crd paths=./... output:crd:dir=artifacts/crd`
 
+创建`crd`:`kb apply -f artifacts/crd/samplecontroller.boyfoo.com_apps.yaml`
+
+运行: `go run . --kubeconfig=/Users/rxt/.kube/config`
 
 

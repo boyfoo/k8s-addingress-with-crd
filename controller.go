@@ -19,6 +19,12 @@ package main
 import (
 	"context"
 	"fmt"
+	netv1 "k8s.io/api/networking/v1beta1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	coreinformersv1 "k8s.io/client-go/informers/core/v1"
+	netinformerv1 "k8s.io/client-go/informers/networking/v1beta1"
+	"k8s.io/client-go/listers/core/v1"
+	networkingv1 "k8s.io/client-go/listers/networking/v1beta1"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -70,8 +76,8 @@ type Controller struct {
 
 	deploymentsLister appslisters.DeploymentLister
 	deploymentsSynced cache.InformerSynced
-	foosLister        listers.FooLister
-	foosSynced        cache.InformerSynced
+	appsLister        listers.AppLister
+	appsSynced        cache.InformerSynced
 
 	// workqueue is a rate limited work queue. This is used to queue work to be
 	// processed instead of performing it as soon as a change happens. This
@@ -81,7 +87,11 @@ type Controller struct {
 	workqueue workqueue.RateLimitingInterface
 	// recorder is an event recorder for recording Event resources to the
 	// Kubernetes API.
-	recorder record.EventRecorder
+	recorder      record.EventRecorder
+	serviceLister v1.ServiceLister
+	serviceSynced cache.InformerSynced
+	ingressLister networkingv1.IngressLister
+	ingressSynced cache.InformerSynced
 }
 
 // NewController returns a new sample controller
@@ -89,7 +99,9 @@ func NewController(
 	kubeclientset kubernetes.Interface,
 	sampleclientset clientset.Interface,
 	deploymentInformer appsinformers.DeploymentInformer,
-	fooInformer informers.FooInformer) *Controller {
+	serviceInformer coreinformersv1.ServiceInformer,
+	ingressInformer netinformerv1.IngressInformer,
+	appInformer informers.AppInformer) *Controller {
 
 	// Create event broadcaster
 	// Add sample-controller types to the default Kubernetes Scheme so Events can be
@@ -106,39 +118,23 @@ func NewController(
 		sampleclientset:   sampleclientset,
 		deploymentsLister: deploymentInformer.Lister(),
 		deploymentsSynced: deploymentInformer.Informer().HasSynced,
-		foosLister:        fooInformer.Lister(),
-		foosSynced:        fooInformer.Informer().HasSynced,
+		serviceLister:     serviceInformer.Lister(),
+		serviceSynced:     serviceInformer.Informer().HasSynced,
+		ingressLister:     ingressInformer.Lister(),
+		ingressSynced:     ingressInformer.Informer().HasSynced,
+		appsLister:        appInformer.Lister(),
+		appsSynced:        appInformer.Informer().HasSynced,
 		workqueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Foos"),
 		recorder:          recorder,
 	}
 
 	klog.Info("Setting up event handlers")
 	// Set up an event handler for when App resources change
-	fooInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.enqueueFoo,
+	appInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: controller.enqueueApp,
 		UpdateFunc: func(old, new interface{}) {
-			controller.enqueueFoo(new)
+			controller.enqueueApp(new)
 		},
-	})
-	// Set up an event handler for when Deployment resources change. This
-	// handler will lookup the owner of the given Deployment, and if it is
-	// owned by a App resource will enqueue that App resource for
-	// processing. This way, we don't need to implement custom logic for
-	// handling Deployment resources. More info on this pattern:
-	// https://github.com/kubernetes/community/blob/8cafef897a22026d42f5e5bb3f104febe7e29830/contributors/devel/controllers.md
-	deploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.handleObject,
-		UpdateFunc: func(old, new interface{}) {
-			newDepl := new.(*appsv1.Deployment)
-			oldDepl := old.(*appsv1.Deployment)
-			if newDepl.ResourceVersion == oldDepl.ResourceVersion {
-				// Periodic resync will send update events for all known Deployments.
-				// Two different versions of the same Deployment will always have different RVs.
-				return
-			}
-			controller.handleObject(new)
-		},
-		DeleteFunc: controller.handleObject,
 	})
 
 	return controller
@@ -157,7 +153,8 @@ func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
 
 	// Wait for the caches to be synced before starting workers
 	klog.Info("Waiting for informer caches to sync")
-	if ok := cache.WaitForCacheSync(stopCh, c.deploymentsSynced, c.foosSynced); !ok {
+	// 等待都同步了在进行下一步
+	if ok := cache.WaitForCacheSync(stopCh, c.deploymentsSynced, c.appsSynced, c.serviceSynced, c.ingressSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
@@ -249,93 +246,72 @@ func (c *Controller) syncHandler(key string) error {
 	}
 
 	// Get the App resource with this namespace/name
-	foo, err := c.foosLister.Foos(namespace).Get(name)
+	// 拿到资源对象 不存在不处理
+	app, err := c.appsLister.Apps(namespace).Get(name)
 	if err != nil {
 		// The App resource may no longer exist, in which case we stop
 		// processing.
 		if errors.IsNotFound(err) {
-			utilruntime.HandleError(fmt.Errorf("foo '%s' in work queue no longer exists", key))
+			utilruntime.HandleError(fmt.Errorf("app '%s' in work queue no longer exists", key))
 			return nil
 		}
 
 		return err
 	}
 
-	deploymentName := foo.Spec.DeploymentName
-	if deploymentName == "" {
-		// We choose to absorb the error here as the worker would requeue the
-		// resource otherwise. Instead, the next time the resource is updated
-		// the resource will be queued again.
-		utilruntime.HandleError(fmt.Errorf("%s: deployment name must be specified", key))
-		return nil
-	}
-
-	// Get the deployment with the name specified in App.spec
-	deployment, err := c.deploymentsLister.Deployments(foo.Namespace).Get(deploymentName)
-	// If the resource doesn't exist, we'll create it
+	// 是否已经有deployment
+	deployment, err := c.deploymentsLister.Deployments(app.Namespace).Get(app.Spec.Deployment.Name)
+	// 没找到就创建
 	if errors.IsNotFound(err) {
-		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Create(context.TODO(), newDeployment(foo), metav1.CreateOptions{})
+		deployment, err = c.kubeclientset.AppsV1().Deployments(app.Namespace).Create(context.TODO(), newDeployment(app), metav1.CreateOptions{})
 	}
-
-	// If an error occurs during Get/Create, we'll requeue the item so we can
-	// attempt processing again later. This could have been caused by a
-	// temporary network failure, or any other transient reason.
+	if err != nil {
+		return err
+	}
+	service, err := c.serviceLister.Services(app.Namespace).Get(app.Spec.Service.Name)
+	if errors.IsNotFound(err) {
+		service, err = c.kubeclientset.CoreV1().Services(app.Namespace).Create(context.TODO(), newService(app), metav1.CreateOptions{})
+	}
+	if err != nil {
+		return err
+	}
+	ingress, err := c.ingressLister.Ingresses(app.Namespace).Get(app.Spec.Ingress.Name)
+	if errors.IsNotFound(err) {
+		ingress, err = c.kubeclientset.NetworkingV1beta1().Ingresses(app.Namespace).Create(context.TODO(), newIngress(app), metav1.CreateOptions{})
+	}
 	if err != nil {
 		return err
 	}
 
 	// If the Deployment is not controlled by this App resource, we should log
 	// a warning to the event recorder and return error msg.
-	if !metav1.IsControlledBy(deployment, foo) {
+	// deployment是否属于app
+	if !metav1.IsControlledBy(deployment, app) {
 		msg := fmt.Sprintf(MessageResourceExists, deployment.Name)
-		c.recorder.Event(foo, corev1.EventTypeWarning, ErrResourceExists, msg)
+		c.recorder.Event(app, corev1.EventTypeWarning, ErrResourceExists, msg)
 		return fmt.Errorf(msg)
 	}
 
-	// If this number of the replicas on the App resource is specified, and the
-	// number does not equal the current desired replicas on the Deployment, we
-	// should update the Deployment resource.
-	if foo.Spec.Replicas != nil && *foo.Spec.Replicas != *deployment.Spec.Replicas {
-		klog.V(4).Infof("App %s replicas: %d, deployment replicas: %d", name, *foo.Spec.Replicas, *deployment.Spec.Replicas)
-		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Update(context.TODO(), newDeployment(foo), metav1.UpdateOptions{})
+	if !metav1.IsControlledBy(service, app) {
+		msg := fmt.Sprintf(MessageResourceExists, service.Name)
+		c.recorder.Event(app, corev1.EventTypeWarning, ErrResourceExists, msg)
+		return fmt.Errorf(msg)
 	}
 
-	// If an error occurs during Update, we'll requeue the item so we can
-	// attempt processing again later. This could have been caused by a
-	// temporary network failure, or any other transient reason.
-	if err != nil {
-		return err
+	if !metav1.IsControlledBy(ingress, app) {
+		msg := fmt.Sprintf(MessageResourceExists, ingress.Name)
+		c.recorder.Event(app, corev1.EventTypeWarning, ErrResourceExists, msg)
+		return fmt.Errorf(msg)
 	}
 
-	// Finally, we update the status block of the App resource to reflect the
-	// current state of the world
-	err = c.updateFooStatus(foo, deployment)
-	if err != nil {
-		return err
-	}
-
-	c.recorder.Event(foo, corev1.EventTypeNormal, SuccessSynced, MessageResourceSynced)
+	c.recorder.Event(app, corev1.EventTypeNormal, SuccessSynced, MessageResourceSynced)
 	return nil
 }
 
-func (c *Controller) updateFooStatus(foo *samplev1alpha1.App, deployment *appsv1.Deployment) error {
-	// NEVER modify objects from the store. It's a read-only, local cache.
-	// You can use DeepCopy() to make a deep copy of original object and modify this copy
-	// Or create a copy manually for better performance
-	fooCopy := foo.DeepCopy()
-	fooCopy.Status.AvailableReplicas = deployment.Status.AvailableReplicas
-	// If the CustomResourceSubresources feature gate is not enabled,
-	// we must use Update instead of UpdateStatus to update the Status block of the App resource.
-	// UpdateStatus will not allow changes to the Spec of the resource,
-	// which is ideal for ensuring nothing other than resource status has been updated.
-	_, err := c.sampleclientset.SamplecontrollerV1alpha1().Foos(foo.Namespace).Update(context.TODO(), fooCopy, metav1.UpdateOptions{})
-	return err
-}
-
-// enqueueFoo takes a App resource and converts it into a namespace/name
+// enqueueApp takes a App resource and converts it into a namespace/name
 // string which is then put onto the work queue. This method should *not* be
 // passed resources of any type other than App.
-func (c *Controller) enqueueFoo(obj interface{}) {
+func (c *Controller) enqueueApp(obj interface{}) {
 	var key string
 	var err error
 	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
@@ -374,13 +350,13 @@ func (c *Controller) handleObject(obj interface{}) {
 			return
 		}
 
-		foo, err := c.foosLister.Foos(object.GetNamespace()).Get(ownerRef.Name)
+		app, err := c.appsLister.Apps(object.GetNamespace()).Get(ownerRef.Name)
 		if err != nil {
-			klog.V(4).Infof("ignoring orphaned object '%s' of foo '%s'", object.GetSelfLink(), ownerRef.Name)
+			klog.V(4).Infof("ignoring orphaned object '%s' of app '%s'", object.GetSelfLink(), ownerRef.Name)
 			return
 		}
 
-		c.enqueueFoo(foo)
+		c.enqueueApp(app)
 		return
 	}
 }
@@ -388,21 +364,20 @@ func (c *Controller) handleObject(obj interface{}) {
 // newDeployment creates a new Deployment for a App resource. It also sets
 // the appropriate OwnerReferences on the resource so handleObject can discover
 // the App resource that 'owns' it.
-func newDeployment(foo *samplev1alpha1.App) *appsv1.Deployment {
+func newDeployment(app *samplev1alpha1.App) *appsv1.Deployment {
 	labels := map[string]string{
-		"app":        "nginx",
-		"controller": foo.Name,
+		"app":        "app-deployment",
+		"controller": app.Name,
 	}
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      foo.Spec.DeploymentName,
-			Namespace: foo.Namespace,
+			Name:      app.Spec.Deployment.Name,
+			Namespace: app.Namespace,
 			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(foo, samplev1alpha1.SchemeGroupVersion.WithKind("App")),
+				*metav1.NewControllerRef(app, samplev1alpha1.SchemeGroupVersion.WithKind("App")),
 			},
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: foo.Spec.Replicas,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: labels,
 			},
@@ -413,11 +388,78 @@ func newDeployment(foo *samplev1alpha1.App) *appsv1.Deployment {
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  "nginx",
-							Image: "nginx:latest",
+							Name:  app.Spec.Deployment.Name,
+							Image: app.Spec.Deployment.Image,
 						},
 					},
 				},
+			},
+		},
+	}
+}
+
+func newService(app *samplev1alpha1.App) *corev1.Service {
+	labels := map[string]string{
+		"app":        "app-deployment",
+		"controller": app.Name,
+	}
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      app.Spec.Service.Name,
+			Namespace: app.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(app, samplev1alpha1.SchemeGroupVersion.WithKind("App")),
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: labels,
+			Ports: []corev1.ServicePort{
+				{
+					Protocol:   corev1.ProtocolTCP,
+					Port:       80,
+					TargetPort: intstr.IntOrString{IntVal: 80},
+				},
+			},
+		},
+	}
+}
+
+func newIngress(app *samplev1alpha1.App) *netv1.Ingress {
+	pathType := netv1.PathTypePrefix
+	return &netv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      app.Spec.Ingress.Name,
+			Namespace: app.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(app, samplev1alpha1.SchemeGroupVersion.WithKind("App")),
+			},
+		},
+		Spec: netv1.IngressSpec{
+			Rules: []netv1.IngressRule{
+				{
+					Host: "prod.jtthink.com",
+					IngressRuleValue: netv1.IngressRuleValue{
+						HTTP: &netv1.HTTPIngressRuleValue{
+							Paths: []netv1.HTTPIngressPath{
+								{
+									Path:     "/",
+									PathType: &pathType,
+									//Backend: netv1.IngressBackend{
+									//	Service: &netv1.IngressServiceBackend{
+									//		Name: app.Spec.Service.Name,
+									//		Port: netv1.ServiceBackendPort{
+									//			Number: 80,
+									//		},
+									//	},
+									//},
+									Backend: netv1.IngressBackend{
+										ServiceName: app.Spec.Service.Name,
+										ServicePort: intstr.FromInt(80),
+									},
+								},
+							},
+						},
+					}},
 			},
 		},
 	}

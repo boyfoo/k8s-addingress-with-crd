@@ -34,8 +34,12 @@ type App struct {
 
 // AppSpec is the spec for a App resource
 type AppSpec struct {
-	DeploymentName string `json:"deploymentName"`
-	Replicas       *int32 `json:"replicas"`
+	Deployment DeploymentSpec `json:"deployment"`
+	Service    ServiceSpec    `json:"service"`
+	Ingress    IngressSpec    `json:"ingress"`
+}
+
+type AppStatus struct {
 }
 
 type DeploymentSpec struct {
@@ -49,13 +53,6 @@ type ServiceSpec struct {
 
 type IngressSpec struct {
 	Name string `json:"name"`
-}
-
-// AppStatus is the status for a App resource
-type AppStatus struct {
-	Deployment DeploymentSpec `json:"deployment"`
-	Service    ServiceSpec    `json:"service"`
-	Ingress    IngressSpec    `json:"ingress"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
